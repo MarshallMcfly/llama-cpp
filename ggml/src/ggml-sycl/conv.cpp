@@ -28,16 +28,17 @@ static  void conv_transpose_1d_kernel(
 
     float accumulator = 0;
 
-    for (int c = 0; c < src0_ne2; c++) {
-        int idx = global_index % dst_ne0;
+    const int idx = global_index % dst_ne0;
 
+    // only inputs with i*s0 <= idx < i*s0 + src0_ne0 contribute
+    const int i_begin = idx >= src0_ne0 ? (idx - src0_ne0) / s0 + 1 : 0;
+    const int i_end   = sycl::min(src1_ne0, idx / s0 + 1);
+
+    for (int c = 0; c < src0_ne2; c++) {
         int kernel_offset = (src0_ne0 * src0_ne1 * c) + (out_index * src0_ne0);
         int input_offset = src1_ne0 * c;
 
-        for (int i = 0; i < src1_ne0; i++) {
-            if (!(idx >= i*s0 && idx < i*s0 + src0_ne0)) {
-                continue;
-            }
+        for (int i = i_begin; i < i_end; i++) {
             int weight_idx = idx - i*s0;
 
             float kernel_weight = src0[kernel_offset + weight_idx];
@@ -71,8 +72,10 @@ static void conv_transpose_1d_f32_f32_sycl(
         });
 }
 
-void ggml_sycl_op_conv_transpose_1d(ggml_backend_sycl_context & ctx, const ggml_tensor *src0,
-    const ggml_tensor *src1, ggml_tensor *dst) {
+void ggml_sycl_op_conv_transpose_1d(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+    const ggml_tensor *src0 = dst->src[0];
+    const ggml_tensor *src1 = dst->src[1];
     const float * src0_d = (const float *)src0->data;
     const float * src1_d = (const float *)src1->data;
 

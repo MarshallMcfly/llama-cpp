@@ -23,12 +23,17 @@ defer {
 }
 
 let model_params = llama_model_default_params()
-guard let model = llama_load_model_from_file(modelPath.cString(using: .utf8), model_params) else {
+guard let model = llama_model_load_from_file(modelPath.cString(using: .utf8), model_params) else {
     print("Failed to load model")
     exit(1)
 }
 defer {
-    llama_free_model(model)
+    llama_model_free(model)
+}
+
+guard let vocab = llama_model_get_vocab(model) else {
+    print("Failed to get vocab")
+    exit(1)
 }
 
 var tokens = tokenize(text: prompt, add_bos: true)
@@ -41,7 +46,7 @@ context_params.n_batch = UInt32(max(n_len, n_parallel))
 context_params.n_threads = 8
 context_params.n_threads_batch = 8
 
-let context = llama_new_context_with_model(model, context_params)
+let context = llama_init_from_model(model, context_params)
 guard context != nil else {
     print("Failed to initialize context")
     exit(1)
@@ -82,36 +87,32 @@ for id: llama_token in tokens {
 
 print("\n")
 
-var batch = llama_batch_init(max(Int32(tokens.count), Int32(n_parallel)), 0, 1)
+let batch = llama_batch_ext_init(context)
 defer {
-    llama_batch_free(batch)
+    llama_batch_ext_free(batch)
 }
 
 // evaluate the initial prompt
-batch.n_tokens = Int32(tokens.count)
-
 for (i, token) in tokens.enumerated() {
-    batch.token[i] = token
-    batch.pos[i] = Int32(i)
-    batch.n_seq_id[i] = 1
-    // batch.seq_id[i][0] = 0
-    // TODO: is this the proper way to do this?
-    if let seq_id = batch.seq_id[i] {
-        seq_id[0] = 0
+    let idx = llama_batch_ext_add_token(batch, 0, token)
+    if idx < 0 {
+        print("llama_batch_ext_add_token() failed: \(idx)")
+        exit(1)
     }
-    batch.logits[i] = 0
+    var pos = llama_pos(i)
+    llama_batch_ext_set_pos(batch, idx, &pos)
 }
 
-// llama_decode will output logits only for the last token of the prompt
-batch.logits[Int(batch.n_tokens) - 1] = 1
+// llama_process will output logits only for the last token of the prompt
+llama_batch_ext_set_output_logits(batch, Int32(tokens.count) - 1, true)
 
-if llama_decode(context, batch) != 0 {
-    print("llama_decode() failed")
+if llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch) != 0 {
+    print("llama_process() failed")
     exit(1)
 }
 
 for i in 1 ..< n_parallel {
-    llama_kv_cache_seq_cp(context, 0, Int32(i), 0, batch.n_tokens)
+    llama_memory_seq_cp(llama_get_memory(context), 0, Int32(i), 0, Int32(tokens.count))
 }
 
 if n_parallel > 1 {
@@ -120,16 +121,17 @@ if n_parallel > 1 {
 
 var streams: [String] = .init(repeating: "", count: n_parallel)
 var streamBuffers: [[CChar]] = .init(repeating: [], count: n_parallel)
-var i_batch = [Int32](repeating: batch.n_tokens - 1, count: n_parallel)
+var i_batch = [Int32](repeating: Int32(tokens.count) - 1, count: n_parallel)
 
-var n_cur = batch.n_tokens
+var n_cur = Int32(tokens.count)
 var n_decode = 0
 
 let t_main_start = ggml_time_us()
 
 while n_cur <= n_len {
     // prepare the next batch
-    batch.n_tokens = 0
+    llama_batch_ext_clear(batch)
+    var n_tokens: Int32 = 0
 
     // sample the next token for each parallel sequence / stream
     for i in 0 ..< n_parallel {
@@ -141,7 +143,7 @@ while n_cur <= n_len {
         let new_token_id = llama_sampler_sample(smpl, context, i_batch[i])
 
         // is it an end of stream? -> mark the stream as finished
-        if llama_token_is_eog(model, new_token_id) || n_cur == n_len {
+        if llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len {
             i_batch[i] = -1
             // print("")
             if n_parallel > 1 {
@@ -160,31 +162,32 @@ while n_cur <= n_len {
         streams[i] += nextStringPiece
 
         // push this new token for next evaluation
-        batch.token[Int(batch.n_tokens)] = new_token_id
-        batch.pos[Int(batch.n_tokens)] = n_cur
-        batch.n_seq_id[Int(batch.n_tokens)] = 1
-        if let seq_id = batch.seq_id[Int(batch.n_tokens)] {
-            seq_id[0] = Int32(i)
+        let idx = llama_batch_ext_add_token(batch, Int32(i), new_token_id)
+        if idx < 0 {
+            print("llama_batch_ext_add_token() failed: \(idx)")
+            exit(1)
         }
-        batch.logits[Int(batch.n_tokens)] = 1
+        var pos = n_cur
+        llama_batch_ext_set_pos(batch, idx, &pos)
+        llama_batch_ext_set_output_logits(batch, idx, true)
 
-        i_batch[i] = batch.n_tokens
+        i_batch[i] = idx
 
-        batch.n_tokens += 1
+        n_tokens += 1
 
         n_decode += 1
     }
 
     // all streams are finished
-    if batch.n_tokens == 0 {
+    if n_tokens == 0 {
         break
     }
 
     n_cur += 1
 
     // evaluate the current batch with the transformer model
-    if llama_decode(context, batch) != 0 {
-        print("llama_decode() failed")
+    if llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch) != 0 {
+        print("llama_process() failed")
         exit(1)
     }
 }
@@ -207,7 +210,7 @@ private func tokenize(text: String, add_bos: Bool) -> [llama_token] {
     let utf8Count = text.utf8.count
     let n_tokens = utf8Count + (add_bos ? 1 : 0)
     let tokens = UnsafeMutablePointer<llama_token>.allocate(capacity: n_tokens)
-    let tokenCount = llama_tokenize(model, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, /*special tokens*/ false)
+    let tokenCount = llama_tokenize(vocab, text, Int32(utf8Count), tokens, Int32(n_tokens), add_bos, /*special tokens*/ false)
     var swiftTokens: [llama_token] = []
     for i in 0 ..< tokenCount {
         swiftTokens.append(tokens[Int(i)])
@@ -218,12 +221,12 @@ private func tokenize(text: String, add_bos: Bool) -> [llama_token] {
 
 private func token_to_piece(token: llama_token, buffer: inout [CChar]) -> String? {
     var result = [CChar](repeating: 0, count: 8)
-    let nTokens = llama_token_to_piece(model, token, &result, Int32(result.count), 0, false)
+    let nTokens = llama_token_to_piece(vocab, token, &result, Int32(result.count), 0, false)
     if nTokens < 0 {
         let actualTokensCount = -Int(nTokens)
         result = .init(repeating: 0, count: actualTokensCount)
         let check = llama_token_to_piece(
-            model,
+            vocab,
             token,
             &result,
             Int32(result.count),

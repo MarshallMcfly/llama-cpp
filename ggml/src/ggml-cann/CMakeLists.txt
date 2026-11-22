@@ -22,13 +22,22 @@ if(NOT SOC_TYPE)
     detect_ascend_soc_type(SOC_VERSION)
     set(SOC_TYPE "${SOC_VERSION}")
     message(STATUS "CANN: SOC_VERSION auto-detected is:${SOC_VERSION}")
-else()
-    string(TOLOWER ${SOC_TYPE} SOC_VERSION)
 endif()
 
-# Construct Soc specify compile option: ASCEND_#Soc_Major_SN. Such as ASCEND_910B, ASCEND310P.
+string(TOLOWER ${SOC_TYPE} SOC_VERSION) # SOC_VERSION need lower
+
+# Construct Soc specify compile option: ASCEND_#Soc_Major_SN. Such as ASCEND_910B, ASCEND_310P.
 string(REGEX MATCH "[0-9]+[a-zA-Z]" SOC_TYPE_MAJOR_SN "${SOC_VERSION}")
 set(SOC_TYPE_COMPILE_OPTION "ASCEND_${SOC_TYPE_MAJOR_SN}")
+string(TOUPPER ${SOC_TYPE_COMPILE_OPTION} SOC_TYPE_COMPILE_OPTION)
+message(STATUS "CANN: SOC_VERSION =  ${SOC_VERSION}")
+option(USE_ACL_GRAPH "Enable CANN graph execution (ACL graph mode)" OFF)
+
+if(USE_ACL_GRAPH AND (SOC_TYPE_MAJOR_SN STREQUAL "310P" OR SOC_TYPE_COMPILE_OPTION STREQUAL "ASCEND_310P"))
+    message(FATAL_ERROR
+        "CANN Graph (ACL graph mode) is not supported on 310P devices. "
+        "Please build with -DUSE_ACL_GRAPH=OFF or use a supported SOC.")
+endif()
 
 if (CANN_INSTALL_DIR)
     # Only Support Linux.
@@ -50,13 +59,11 @@ if (CANN_INSTALL_DIR)
         ${CANN_INSTALL_DIR}/acllib/include
     )
 
-    add_subdirectory(kernels)
     list(APPEND CANN_LIBRARIES
         ascendcl
         nnopbase
         opapi
         acl_op_compiler
-        ascendc_kernels
     )
 
     file(GLOB GGML_SOURCES_CANN "*.cpp")
@@ -67,6 +74,13 @@ if (CANN_INSTALL_DIR)
     target_link_directories(ggml-cann PRIVATE ${CANN_INSTALL_DIR}/lib64)
 
     target_compile_definitions(ggml-cann PRIVATE "-D${SOC_TYPE_COMPILE_OPTION}")
+
+    if (USE_ACL_GRAPH)
+        target_compile_definitions(ggml-cann PRIVATE USE_ACL_GRAPH)
+        message(STATUS "CANN: USE_ACL_GRAPH is enabled.")
+    else()
+        message(STATUS "CANN: USE_ACL_GRAPH is disabled.")
+    endif()
 
     message(STATUS "CANN: CANN_INCLUDE_DIRS =  ${CANN_INCLUDE_DIRS}")
     message(STATUS "CANN: CANN_LIBRARIES =  ${CANN_LIBRARIES}")

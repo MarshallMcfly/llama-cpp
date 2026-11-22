@@ -125,7 +125,7 @@ static llama_tests read_tests(const std::string & fname_inp, const std::string &
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s vocab-file [text-file]\n", argv[0]);
+        fprintf(stderr, "Usage: %s vocab-file [text-file] [--check-decode]\n", argv[0]);
         return 1;
     }
 
@@ -135,8 +135,13 @@ int main(int argc, char **argv) {
     const std::string fname_out = fname + ".out";
 
     std::string fname_text;
-    if (argc > 2) {
-        fname_text = argv[2];
+    bool check_decode = false; // also check that the expected tokens detokenize to the input text
+    for (int i = 2; i < argc; i++) {
+        if (std::string(argv[i]) == "--check-decode") {
+            check_decode = true;
+        } else {
+            fname_text = argv[i];
+        }
     }
 
     fprintf(stderr, "%s : reading vocab from: '%s'\n", __func__, fname.c_str());
@@ -152,7 +157,7 @@ int main(int argc, char **argv) {
 
         mparams.vocab_only = true;
 
-        model = llama_load_model_from_file(fname.c_str(), mparams);
+        model = llama_model_load_from_file(fname.c_str(), mparams);
 
         if (model == NULL) {
             fprintf(stderr, "%s: error: failed to load vocab '%s'\n", __func__, fname.c_str());
@@ -161,11 +166,11 @@ int main(int argc, char **argv) {
 
         auto cparams = llama_context_default_params();
 
-        ctx = llama_new_context_with_model(model, cparams);
+        ctx = llama_init_from_model(model, cparams);
 
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to load vocab '%s'\n", __func__, fname.c_str());
-            llama_free_model(model);
+            llama_model_free(model);
             return 1;
         }
     }
@@ -244,6 +249,14 @@ int main(int argc, char **argv) {
 
                     success = false;
                 }
+
+                if (check_decode) {
+                    const std::string dec = common_detokenize(ctx, test_kv.second);
+                    if (dec != test_kv.first) {
+                        fprintf(stderr, "%s : failed decode:  '%s' detokenized to '%s'\n", __func__, test_kv.first.c_str(), dec.c_str());
+                        success = false;
+                    }
+                }
             }
         });
     }
@@ -300,8 +313,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s : tokens written to '%s'\n", __func__, (fname_text + ".tokcpp").c_str());
     }
 
-    llama_free_model(model);
     llama_free(ctx);
+    llama_model_free(model);
 
     llama_backend_free();
 

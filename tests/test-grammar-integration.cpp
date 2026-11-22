@@ -2,18 +2,25 @@
 #undef NDEBUG
 #endif
 
-#include "unicode.h"
-#include "llama-grammar.h"
 #include "json-schema-to-grammar.h"
+
+#include "../src/unicode.h"
+#include "../src/llama-grammar.h"
+
+#include "json.h"
 
 #include <cassert>
 #include <string>
 #include <vector>
 
-using json = nlohmann::ordered_json;
+using json = common_json;
+
+static llama_grammar * build_grammar_with_root(const std::string & grammar_str, const char * grammar_root) {
+    return llama_grammar_init_impl(nullptr, grammar_str.c_str(), grammar_root, false, nullptr, 0, nullptr, 0);
+}
 
 static llama_grammar * build_grammar(const std::string & grammar_str) {
-    return llama_grammar_init_impl(nullptr, grammar_str.c_str(), "root");
+    return build_grammar_with_root(grammar_str, "root");
 }
 
 static bool test_build_grammar_fails(const std::string & grammar_str) {
@@ -29,16 +36,66 @@ static bool test_build_grammar_fails(const std::string & grammar_str) {
     return grammar_fails;
 }
 
+struct token_and_piece {
+    llama_token token;
+    std::string piece;
+};
+
+// token() encodes a 32-bit ID as 5 bytes: a 0xff marker followed by the ID in big-endian order.
+static std::string token(llama_token id) {
+    return std::string{
+        static_cast<char>(0xff),
+        static_cast<char>((id >> 24) & 0xff),
+        static_cast<char>((id >> 16) & 0xff),
+        static_cast<char>((id >> 8) & 0xff),
+        static_cast<char>(id & 0xff)
+    };
+}
+
+// parse_tokens() parses the token encodes above and UTF-8 text.
+static std::vector<token_and_piece> parse_tokens(const std::string & input) {
+    std::vector<token_and_piece> result;
+    result.reserve(input.size());
+    size_t offset = 0;
+    while (offset < input.size()) {
+        try {
+            if (static_cast<unsigned char>(input[offset]) == 0xff) {
+                if (offset + 5 > input.size()) {
+                    throw std::runtime_error("not enough bytes for token id");
+                }
+                uint32_t val =
+                    (static_cast<unsigned char>(input[offset + 1]) << 24) |
+                    (static_cast<unsigned char>(input[offset + 2]) << 16) |
+                    (static_cast<unsigned char>(input[offset + 3]) << 8)  |
+                    (static_cast<unsigned char>(input[offset + 4]));
+                auto piece = "<[" + std::to_string(val) + "]>";
+                result.push_back({static_cast<llama_token>(val), piece});
+                offset += 5;
+            } else {
+                uint32_t cpt = unicode_cpt_from_utf8(input, offset);
+                result.push_back({0, unicode_cpt_to_utf8(cpt)});
+            }
+        } catch (const std::invalid_argument & /*ex*/) {
+            // Silently ignore invalid UTF-8 input to avoid leaking the exception beyond llama_tokenize
+            ++offset;
+            result.push_back({0, unicode_cpt_to_utf8(0xFFFD)}); // replacement character
+        }
+    }
+    return result;
+}
+
 static bool match_string(const std::string & input, llama_grammar * grammar) {
-    const auto cpts = unicode_cpts_from_utf8(input);
+    const auto parsed = parse_tokens(input);
 
-    const llama_grammar_rules  & rules      = llama_grammar_get_rules (grammar);
-          llama_grammar_stacks & stacks_cur = llama_grammar_get_stacks(grammar);
+    auto & stacks_cur = llama_grammar_get_stacks(grammar);
 
-    for (const auto & cpt : cpts) {
-        const llama_grammar_stacks stacks_prev = llama_grammar_get_stacks(grammar); // copy
-
-        llama_grammar_accept(rules, stacks_prev, cpt, stacks_cur);
+    for (const auto & in : parsed) {
+        try {
+            llama_grammar_accept_token(*grammar, in.token, in.piece);
+        } catch (const std::runtime_error & /*e*/) {
+            // normally this shouldn't get hit because of llama_grammar_apply
+            return false;
+        }
 
         if (stacks_cur.empty()) {
             // no stacks means that the grammar failed to match at this point
@@ -63,7 +120,7 @@ static void test(const std::string & test_desc, const std::string & grammar_str,
     auto * grammar = build_grammar(grammar_str);
 
     // Save the original grammar stacks so that we can reset after every new string we want to test
-    const llama_grammar_stacks stacks_org = llama_grammar_get_stacks(grammar);
+    const llama_grammar_stacks stacks_org = llama_grammar_get_stacks(grammar); // copy
 
     llama_grammar_stacks & stacks_cur = llama_grammar_get_stacks(grammar);
 
@@ -132,10 +189,23 @@ static void test_grammar(const std::string & test_desc, const std::string & gram
     test(test_desc + ". Grammar: " + grammar_str, grammar_str, passing_strings, failing_strings);
 }
 static void test_schema(const std::string & test_desc, const std::string & schema_str, const std::vector<std::string> & passing_strings, const std::vector<std::string> & failing_strings) {
-    test(test_desc + ". Schema: " + schema_str, json_schema_to_grammar(json::parse(schema_str)), passing_strings, failing_strings);
+    test(test_desc + ". Schema: " + schema_str, json_schema_to_grammar(json::parse(schema_str), true), passing_strings, failing_strings);
 }
 
 static void test_simple_grammar() {
+    test_grammar(
+        "left factor leading empty suffix",
+        "root ::= \"ab\" | \"abc\" | \"abd\" | \"abe\"",
+        {"ab", "abc", "abd", "abe"}, {"", "a", "abb", "abcc"});
+    test_grammar(
+        "left factor middle empty suffix",
+        "root ::= \"abc\" | \"ab\" | \"abd\" | \"abe\"",
+        {"ab", "abc", "abd", "abe"}, {"", "a", "abb", "abcc"});
+    test_grammar(
+        "left factor recursive references",
+        "root ::= \"ok\" | choice\nchoice ::= a | b | c | d\na ::= \"x\" a\nb ::= \"x\" b\nc ::= \"x\" c\nd ::= \"x\" d",
+        {"ok"}, {"", "x", "xx", "okx"});
+
     test_schema(
         "min 0",
         R"""({
@@ -302,6 +372,30 @@ static void test_simple_grammar() {
         }
     );
     test_schema(
+        "min 1 max 900719925474091",
+        // Schema
+        R"""({
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 900719925474091
+        })""",
+        // Passing strings
+        {
+            "1",
+            "2",
+            "10",
+            "900719925474090",
+            "900719925474091",
+        },
+        // Failing strings
+        {
+            "0",
+            "01",
+            "900719925474092",
+            "9007199254740910",
+        }
+    );
+    test_schema(
         "min -1 max 1",
         R"""({
             "type": "integer",
@@ -402,6 +496,30 @@ static void test_simple_grammar() {
             "12a45",
         }
     );
+
+    // Test case for a simple grammar with tokens
+    test_grammar(
+        "simple grammar with tokens",
+        R"""(
+            root ::= <[10]> content <[11]>
+            content ::= (!<[11]>)*)""",
+        // Passing strings
+        {
+            token(10) + "hello world" + token(11),
+            token(10) + "text with " + token(12) + " other tokens " + token(13) + " mixed in" + token(11),
+            token(10) + token(11),
+            token(10) + token(12) + token(13) + token(14) + token(15) + token(11),
+            token(10) + "a" + token(11),
+        },
+        // Failing strings
+        {
+            token(10) + "missing end token",
+            token(10),
+            "missing start token" + token(11),
+            token(10) + token(11) + token(11),  // double end token
+            token(11) + "wrong order" + token(10),
+        }
+    );
 }
 
 static void test_complex_grammar() {
@@ -463,6 +581,34 @@ static void test_complex_grammar() {
             "123+456*789-123/456+789*123-456/789+123*456-789/123+456*789-123/456+789*123-456/",
         }
     );
+
+    // Test case for a more complex grammar with tokens
+    test_grammar(
+        "complex grammar with tokens",
+        R"""(
+            root ::= reasoning+ content tool-call*
+            reasoning ::= <[10]> (!<[11]>)* <[11]>
+            content ::= <[20]> (!<[21]>)* <[21]>
+            tool-call ::= <[12]> name <[13]> args <[14]>
+            name ::= (!<[13]>)+
+            args ::= (!<[14]>)*)""",
+        // Passing strings
+        {
+            token(10) + "I am thinking" + token(11) + token(20) + "hello world!" + token(21) + token(12) + "search" + token(13) + "query=test" + token(14),
+            token(10) + "reasoning 1" + token(11) + token(10) + "reasoning 2" + token(11) + token(20) + token(21) + token(12) + "tool" + token(13) + token(14),
+            token(10) + token(11) + token(20) + "content" + token(21),
+            token(10) + "think" + token(12) + " nested" + token(11) + token(20) + token(10) + "more content" + token(21) + token(12) + "fn" + token(13) + "x=1,y=2" + token(14) + token(12) + "fn2" + token(13) + token(14),
+            token(10) + "reasoning" + token(11) + token(10) + "more" + token(11) + token(10) + "even more" + token(11) + token(20) + "text" + token(21) + token(12) + "a" + token(13) + "b" + token(14) + token(12) + "c" + token(13) + "d" + token(14),
+        },
+        // Failing strings
+        {
+            token(20) + "content only" + token(21),
+            token(10) + "no closing reasoning",
+            token(10) + token(11) + token(20) + "no closing content",
+            token(10) + token(11) + token(20) + token(21) + token(12) + "incomplete tool",
+            token(10) + token(11) + token(11) + token(20) + token(21),
+        }
+    );
 }
 
 static void test_special_chars() {
@@ -490,6 +636,19 @@ static void test_special_chars() {
             "🔵🟠abc🟠🔵"
         }
     );
+
+    test_grammar(
+        "skip left factoring inside character classes",
+        "root ::= [ab] \"x\" | [ac] \"x\" | [ad] \"x\" | [ae] \"x\"",
+        {"ax", "bx", "cx", "dx", "ex"}, {"", "a", "fx", "axx"});
+    test_grammar(
+        "skip left factoring inside character ranges",
+        "root ::= [a-b] \"x\" | [a-c] \"x\" | [a-d] \"x\" | [a-e] \"x\"",
+        {"ax", "bx", "cx", "dx", "ex"}, {"", "a", "fx", "axx"});
+    test_grammar(
+        "left factor referenced character alternatives",
+        "root ::= a | b | c | d\na ::= \"p\" [a] \"x\"\nb ::= \"p\" [ab] \"x\"\nc ::= \"p\" [ac] \"x\"\nd ::= \"p\" [ad] \"x\"",
+        {"pax", "pbx", "pcx", "pdx"}, {"", "px", "pex", "paxx"});
 }
 
 static void test_quantifiers() {
@@ -655,6 +814,24 @@ static void test_quantifiers() {
             "0xFF 0x12 0xAB 0x00 0x00 0x00",
         }
     );
+    test_grammar(
+        "segfault",
+        // Grammar
+        R"""(
+            root ::= ( [x]* )*
+        )""",
+        // Passing strings
+        {
+            "",
+            "x",
+            "xx"
+        },
+        // Failing strings
+        {
+            "y",
+            "yy"
+        }
+    );
 }
 
 static void test_failure_missing_root() {
@@ -728,6 +905,48 @@ static void test_failure_left_recursion() {
         empty ::= "blah" | )""";
     assert(test_build_grammar_fails(hardest_str));
 
+    const auto chain = [](int n) {
+        std::string s = "root ::= r0\n";
+        for (int i = 0; i < n; i++) {
+            s += "r" + std::to_string(i) + " ::= r" + std::to_string(i + 1) + "\n";
+        }
+        return s + "r" + std::to_string(n) + " ::= \"a\"\n";
+    };
+    llama_grammar * grammar = build_grammar(chain(100));
+    assert(grammar != nullptr);
+    llama_grammar_free_impl(grammar);
+    assert(test_build_grammar_fails(chain(1000)));
+
+    fprintf(stderr, "  ✅︎ Passed\n");
+}
+
+static void test_failure_missing_root_symbol() {
+    fprintf(stderr, "⚫ Testing missing root symbol:\n");
+
+    const std::string grammar_str = R"""(
+        root ::= "foobar"
+    )""";
+
+    llama_grammar * failure_result = build_grammar_with_root(grammar_str, "nonexistent");
+    assert(failure_result == nullptr);
+
+    fprintf(stderr, "  ✅︎ Passed\n");
+}
+
+static void test_custom_root_symbol_check() {
+    fprintf(stderr, "⚫ Testing custom root symbol check:\n");
+
+    const std::string custom_root_grammar_str = R"""(
+        foobar ::= "foobar"
+    )""";
+
+    llama_grammar * failure_result = build_grammar_with_root(custom_root_grammar_str, "root");
+    assert(failure_result == nullptr);
+
+    llama_grammar * success_result = build_grammar_with_root(custom_root_grammar_str, "foobar");
+    assert(success_result != nullptr);
+    llama_grammar_free_impl(success_result);
+
     fprintf(stderr, "  ✅︎ Passed\n");
 }
 
@@ -737,7 +956,7 @@ static void test_json_schema() {
     // Otherwise, this test structure is the same.
 
     test_schema(
-        "empty schema (object)",
+        "empty schema (any value)",
         // Schema
         R"""(
             {}
@@ -746,14 +965,16 @@ static void test_json_schema() {
         {
             R"""({})""",
             R"""({"foo": "bar"})""",
-        },
-        // Failing strings
-        {
-            "",
             "[]",
             "null",
             R"""("")""",
             "true",
+        },
+        // Failing strings
+        {
+            "",
+            R"""({"foo"})""",
+            "foo",
         }
     );
 
@@ -1293,6 +1514,25 @@ static void test_json_schema() {
             // R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green", "home"]})""",
         }
     );
+
+    // the deepest schema of json_schema_to_grammar must give a valid grammar
+    std::string deep_schema;
+    for (int i = 0; i < 127; i++) {
+        deep_schema += R"({"type": "array", "items": )";
+    }
+    deep_schema += R"({"type": "string"})" + std::string(127, '}');
+    test_schema(
+        "127 nested arrays",
+        deep_schema,
+        // Passing strings
+        {
+            std::string(127, '[') + R"("a")" + std::string(127, ']'),
+        },
+        // Failing strings
+        {
+            std::string(126, '[') + R"("a")" + std::string(126, ']'),
+        }
+    );
 }
 
 int main() {
@@ -1304,6 +1544,8 @@ int main() {
     test_failure_missing_root();
     test_failure_missing_reference();
     test_failure_left_recursion();
+    test_failure_missing_root_symbol();
+    test_custom_root_symbol_check();
     test_json_schema();
     fprintf(stdout, "All tests passed.\n");
     return 0;
